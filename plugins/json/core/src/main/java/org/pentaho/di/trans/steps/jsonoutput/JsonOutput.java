@@ -180,6 +180,7 @@ public class JsonOutput extends BaseStep implements StepInterface {
       // no more input to be expected...
       if ( !data.rowsAreSafe ) {
         // Let's output the remaining unsafe data
+        // 输出Json
         outPutRow( r );
       }
 
