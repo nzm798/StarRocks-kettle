@@ -240,7 +240,7 @@ public class JsonOutput extends BaseStep implements StepInterface {
       incrementLinesOutput();
       putRow( data.outputRowMeta, outputRowData );
     }
-
+    // 写入文件
     if ( data.writeToFile && !data.ja.isEmpty() ) {
       // Open a file
       if ( !openNewFile() ) {
