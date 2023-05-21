@@ -1,3 +1,5 @@
+
+
 # 支持StarRocks Kettle Connector
 
 ## 一、项目介绍
@@ -408,6 +410,10 @@ StarRocks Connector方法使用INSERT语句进行数据的导入相对上一种�
 
 StarRocks-Bulk-Loader方法需要我们实现一个Step插件。step在 Kettle数据流中实现数据处理任务， 它对数据行流进行操作。Step专为输入、处理或输出而设计。输入步骤从外部数据源（如文件或数据库）提取数据行。处理步骤处理数据行、执行字段计算和流操作，例如联接或筛选。 输出步骤将处理后的数据写回存储、文件或数据库。
 
+以MySQL为例介绍具体实现细节。
+
+![](image/ospp02.jpg)
+
 #### 4.1.1 Step plugins实现
 
 step plugin通过实现四个不同的 Java 接口与 Kettle 集成。每个接口代表由Kettle Step执行的一组职责。 每个接口都有一个基类，该基类实现接口的大部分，以简化插件开发。
@@ -769,6 +775,621 @@ static class OpenFifo extends Thread {
 }
 ~~~
 
+**4.writeRowToBulk()文件写入**
 
+writeRowToBulk方法可以实现自定义文件格式的写入，实例中主要实现了CSV格式的数据写入。
+
+~~~java
+private void writeRowToBulk( RowMetaInterface rowMeta, Object[] r ) throws KettleException {}
+~~~
+
+通过结合Meta数据，将其数据按照Meta中不同列对应的数据类型转换成对应列的，最后转换为Bytes，将其写入fifo数据中。
+
+data.fifoStream就是Data从OpenFifo类中打开的文件流获取。
+
+~~~java
+for ( int i = 0; i < data.keynrs.length; i++ ) {
+  if ( i > 0 ) {
+    // 写入分隔符
+    // 分隔符在Data定义
+    data.fifoStream.write( data.separator );
+  }
+  int index = data.keynrs[i];
+  //要填数据的类型元数据
+  ValueMetaInterface valueMeta = rowMeta.getValueMeta( index );
+  //valueData行中要填的数据
+  Object valueData = r[index];
+  if ( valueData == null ) {
+    data.fifoStream.write( "NULL".getBytes() );
+  } else {
+    // 写入对应格式的数据
+    switch ( valueMeta.getType() ) {
+      case ValueMetaInterface.TYPE_STRING:
+        data.fifoStream.write( data.quote );
+        if ( valueMeta.isStorageBinaryString() //检查是否存储为二进制字符串
+            && meta.getFieldFormatType()[i] == MySQLBulkLoaderMeta.FIELD_FORMAT_TYPE_OK ) {
+          // We had a string, just dump it back.
+          data.fifoStream.write( (byte[]) valueData );
+        } else {
+          String string = valueMeta.getString( valueData );
+          if ( string != null ) {
+            if ( meta.getFieldFormatType()[i] == MySQLBulkLoaderMeta.FIELD_FORMAT_TYPE_STRING_ESCAPE ) {
+              string = Const.replace( string, meta.getEscapeChar(), meta.getEscapeChar() + meta.getEscapeChar() );
+              string = Const.replace( string, meta.getEnclosure(), meta.getEscapeChar() + meta.getEnclosure() );
+            }
+            data.fifoStream.write( string.getBytes() );
+          }
+        }
+        data.fifoStream.write( data.quote );
+        break;
+      case ValueMetaInterface.TYPE_INTEGER:
+        ...
+      case ValueMetaInterface.TYPE_DATE:
+        ...
+      case ...
+      ...
+  }
+}
+~~~
+
+最后新启一行数据。
+
+~~~java
+// finally write a newline
+data.fifoStream.write( data.newline );
+if ( ( getLinesOutput() % 5000 ) == 0 ) {
+  data.fifoStream.flush();
+}
+~~~
+
+上述过程就是实现数据处理和导入的最主要过程，之后会简单描述实现导入过程用到的其余必要实现的接口以及其中简单的方法介绍。
+
+##### Step clean-up
+
+转换完成后，Kettle 会在所有Step中调用 dispose。
+
+~~~java
+/**
+ * 需要采取措施来释放在 init（） 或后续行处理期间分配的资源。
+ * 实现应清除 StepDataInterfaceObject 的所有字段，并确保所有打开的文件或连接都已正确关闭。
+ * 对于从 BaseStep 派生的任何步骤，必须调用 super.dispose（） 以确保正确的释放。
+ */
+@Override
+public void dispose( StepMetaInterface smi, StepDataInterface sdi ) {
+  meta = (MySQLBulkLoaderMeta) smi;
+  data = (MySQLBulkLoaderData) sdi;
+  // Close the output streams if still needed.
+  ...
+    if ( data.fifoStream != null ) {
+      data.fifoStream.close();
+    }
+    // Stop the SQL execution thread
+    if ( data.sqlRunner != null ) {
+      data.sqlRunner.join();
+      data.sqlRunner = null;
+    }
+    // Release the database connection
+    if ( data.db != null ) {
+      data.db.disconnect();
+      data.db = null;
+    }
+    // remove the fifo file...
+    try {
+      if ( data.fifoFilename != null ) {
+        new File( data.fifoFilename ).delete();
+      }
+    } 
+    ...
+  super.dispose( smi, sdi );
+}
+~~~
+
+#### 4.1.3 Meta数据信息类
+
+StepMetaInterface 接口是插件实现的主要 Java 接口，它主要用于Kettle中Step之间的通信，传递各Step之间的数据信息。
+
+| Java Interface | [org.pentaho.di.trans.step.StepMetaInterface](https://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/StepMetaInterface.html) |
+| -------------- | ------------------------------------------------------------ |
+| Base class     | [org.pentaho.di.trans.step.BaseStepMeta](https://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/BaseStepMeta.html) |
+
+给接口的实现类主要需要实现如下方法。
+
+##### Step配置的传递跟踪
+
+实现类使用具有相应 get 和 set 方法的私有字段跟踪Step设置。 实现 StepDialogInterface 的对话框类使用这些方法将用户提供的配置复制到对话框中和从对话框中复制出来。这些接口方法还用于设置的保存。
+
+~~~java
+/**
+ * 每次创建新step时都会调用此方法，并将步骤配置分配或设置为合理的默认值。
+ * 创建新step时，Kettle客户端 （Spoon） 将使用此处设置的值。这是确保将步骤设置初始化为非空值。在序列化和对话框填充中处理空值可能很麻烦，因此大多数Kettle Step实现在所有步骤设置中都坚持使用非空值。
+ */
+public void setDefault(){
+    fieldTable = null;
+	databaseMeta = null;
+	schemaName = "";
+	tableName = BaseMessages.getString( PKG, "MySQLBulkLoaderMeta.DefaultTableName" );
+	encoding = "";
+	fifoFileName = "/tmp/fifo";
+	delimiter = "\t";
+	enclosure = "\"";
+	escapeChar = "\\";
+    ...
+}
+    
+/**
+ * 在Kettle客户端中复制step时调用此方法。它返回Step元对象的深层副本。
+ * 如果Step配置存储在可修改的对象（如列表或自定义帮助程序对象）中，则实现类必须创建适当的深层副本。
+ */
+public Object clone(){
+    MySQLBulkLoaderMeta retval = (MySQLBulkLoaderMeta) super.clone();
+    int nrvalues = fieldTable.length;
+
+    retval.allocate( nrvalues );
+    System.arraycopy( fieldTable, 0, retval.fieldTable, 0, nrvalues );
+    System.arraycopy( fieldStream, 0, retval.fieldStream, 0, nrvalues );
+    System.arraycopy( fieldFormatType, 0, retval.fieldFormatType, 0, nrvalues );
+
+    return retval;
+}
+~~~
+
+##### 序列化Step配置
+
+Kettle 插件将其设置序列化为 XML 和 Kettle存储库，实现了Step配置数据的存储和读取。
+
+~~~java
+/**
+ * 每当步骤将其设置序列化为 XML 时，Kettle都会调用此方法。在Kettle客户端中保存转换时调用它。
+ * 该方法返回包含序列化步骤设置的 XML 字符串。该字符串包含一系列 XML 标记，每个设置一个标记。
+ * 帮助程序类 org.pentaho.di.core.xml.XMLHandler 构造 XML 字符串。
+ */
+public String getXML(){
+    StringBuilder retval = new StringBuilder( 300 );
+    retval.append( "    " ).append(
+        XMLHandler.addTagValue( "connection", databaseMeta == null ? "" : databaseMeta.getName() ) );
+    retval.append( "    " ).append( XMLHandler.addTagValue( "schema", schemaName ) );
+    retval.append( "    " ).append( XMLHandler.addTagValue( "table", tableName ) );
+    ...
+    ...
+    return retval.toString();
+}
+
+/**
+ * 每当Step从XML中读取其设置时，Kettle都会调用此方法。
+ * 包含步骤设置的 XML 节点作为参数传入。
+ * 同样，帮助程序类 org.pentaho.di.core.xml.XMLHandler 从 XML 节点读取步骤设置。
+ */
+public void loadXML( Node stepnode, List<DatabaseMeta> databases, IMetaStore metaStore ) throws KettleXMLException {
+    readData( stepnode, databases );
+  }
+~~~
+
+~~~java
+/**
+ * 每当步骤将其设置保存到 Kettle repository时，Kettle 都会调用此方法。
+ * 作为第一个参数传入的repository对象提供了一组用于序列化步骤设置的方法。
+ * 在调用存储库序列化方法时，步骤将传入的transformation id 和step ID 用作标识符。
+ */
+public void saveRep( Repository rep, IMetaStore metaStore, ObjectId id_transformation, ObjectId id_step )
+    throws KettleException {
+    try {
+      rep.saveDatabaseMetaStepAttribute( id_transformation, id_step, "id_connection", databaseMeta );
+      rep.saveStepAttribute( id_transformation, id_step, "schema", schemaName );
+      rep.saveStepAttribute( id_transformation, id_step, "table", tableName );
+      ...
+      // Also, save the step-database relationship!
+      if ( databaseMeta != null ) {
+        rep.insertStepDatabase( id_transformation, id_step, databaseMeta.getObjectId() );
+      }
+      ...
+    }
+
+/**
+ * 每当步骤从Kettle存储库读取其配置时，Kettle都会调用此方法。
+ * 参数中给出的Step ID 在使用存储库序列化方法时用作标识符。
+ */
+public void readRep( Repository rep, IMetaStore metaStore, ObjectId id_step, List<DatabaseMeta> databases )
+    throws KettleException {
+    try {
+      databaseMeta = rep.loadDatabaseMetaFromStepAttribute( id_step, "id_connection", databases );
+      schemaName = rep.getStepAttributeString( id_step, "schema" );
+      tableName = rep.getStepAttributeString( id_step, "table" );
+      ...
+~~~
+
+开发插件时，请确保序列化代码与step dialog中可用的设置同步。在 Kettle客户端中测试step时，Kettle 会在内部保存并加载转换的副本，然后再执行转换。
+
+##### 提供其他插件的实例
+
+StepMetaInterface插件类是主类，与Kettle架构的其余部分捆绑在一起。 它负责提供实现 StepDialogInterface、StepTInterface 和 StepDataTInterface 的其他插件类的实例。 以下方法涵盖了这些职责。每个方法实现构造相应类的新实例，将传入的参数转发给构造函数。
+
+getDialog方法在**StepMetaInterface的基类BaseStepMeat类中实现**，其余两个方法都要在插件类中实现。
+
+~~~java
+/**
+ * 这些方法中的每一个都返回实现 StepDialogInterface、StepTInterface 和 StepDataInterface 的插件类的新实例。
+ */
+public StepDialogInterface getDialog()
+public StepInterface getStep()
+public StepDataInterface getStepData()
+~~~
+
+##### 提交Step对Row数据的更改
+
+Kettle需要知道Step如何影响行结构。Step可能是添加或删除字段，以及修改字段的元数据。实现步Step插件这一方面的方法是getFields（）。如果Step没有对Row数据进行更改，该方法则可以不用实现。向StarRocks导入数据就可以不用实现该方法。
+
+~~~java
+/**
+ * 给定输入行的描述，插件对其进行修改以匹配其输出字段的结构。该实现修改传入的 RowMetaInterfaceobject 以反映对行流的更改。步骤将字段添加到行结构中。
+ * 这是通过创建 ValueMeta 对象（例如 ValueMetaInterface 的 PDI 默认实现）并将它们附加到 RowMetaInterface 对象来完成的。
+ */
+public void getFields( RowMetaInterface rowMeta, String origin, RowMetaInterface[] info, StepMeta nextStep,
+      VariableSpace space, Repository repository, IMetaStore metaStore ) throws KettleStepException {
+    // Default: nothing changes to rowMeta
+  }
+~~~
+
+##### Step验证
+
+Kettle客户端支持Validate Transformation功能，该功能会触发所有步骤的自检。Kettle 调用canvas上每个Step的 check（） 方法，允许每个Step验证其设置。
+
+```java
+/**
+ * 每个Step都有机会验证其设置并验证用户给出的配置是否合理。
+ * 此外，Step会检查它是否连接到前面或后续步骤，如果Step的性质需要这种连接。
+ * 例如，输入Step可能期望没有前面的步骤。check 方法传入检查备注列表，该方法将其验证结果追加到该列表。
+ * Kettle客户端显示从步骤中收集的备注列表，允许您在出现验证警告或错误时采取纠正措施。
+ */
+public void check()
+```
+
+##### Kettle插件系统接口
+
+实现 StepMetaInterface 的类必须使用 Step Java annotation进行注释。提供以下注释属性：
+
+| **Attribute**       | **Description**                                              |
+| ------------------- | ------------------------------------------------------------ |
+| id                  | step的全局唯一 ID                                            |
+| image               | step的 png 图标图像的资源位置                                |
+| name                | step的简短标签                                               |
+| description         | step的详细描述                                               |
+| categoryDescription | step应显示在 PDI 步骤树中的类别。例如输入、输出、转换等。    |
+| i18nPackageName     | 如果在注释属性中提供了 i18nPackageName 属性，那么名称、描述和类别描述的值将解释为相对于给定包中包含的消息包的 i18n 键。可以在扩展格式 i18n： key 中提供密钥，以指定与 i18nPackageName 属性中给出的软件包不同的包。 |
+
+以MysqlBulkLoaderMeta为例：
+
+~~~java
+@Step( id = "MySQLBulkLoader", name = "BaseStep.TypeLongDesc.MySQLBulkLoader",
+  description = "BaseStep.TypeTooltipDesc.MySQLBulkLoader",
+  categoryDescription = "i18n:org.pentaho.di.trans.step:BaseStep.Category.Bulk",
+  image = "BLKMYSQL.svg",
+  documentationUrl = "http://wiki.pentaho.com/display/EAI/MySQL+Bulk+Loader",
+  i18nPackageName = "org.pentaho.di.trans.steps.mysqlbulkloader" )
+@InjectionSupported( localizationPrefix = "MySQLBulkLoader.Injection.", groups = { "FIELDS" } )
+public class MySQLBulkLoaderMeta extends BaseStepMeta implements StepMetaInterface,
+    ProvidesDatabaseConnectionInformation {
+    
+}
+~~~
+
+#### 4.1.4 Data数据信息类
+
+实现 StepInterface 的类不会在其任何字段中存储处理状态。 实现 StepDataInterface 的附加类用于存储处理状态，包括状态标志、索引、缓存表、数据库连接、文件句柄、以及各列的数据参数等。 StepDataInterface 的实现声明行处理期间使用的字段并添加访问器函数。 实质上，实现 StepDataInterface 的类在行处理期间用作字段变量的位置。
+
+| **Java Interface** | [org.pentaho.di.trans.step.StepDataInterface](http://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/StepDataInterface.html) |
+| ------------------ | ------------------------------------------------------------ |
+| **Base class**     | [org.pentaho.di.trans.step.BaseStepData](http://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/BaseStepData.html) |
+
+Kettle在适当的时间创建实现 StepDataInterface 的类的实例，并在适当的方法调用中将其传递给 StepInterface 对象。 基类已经实现了与 Kettle的所有必要交互，无需重写任何基类方法。
+
+~~~java
+/**
+ * 存储 MySQL 批量加载步骤的数据。
+ */
+public class MySQLBulkLoaderData extends BaseStepData implements StepDataInterface {
+  public Database db;
+
+  public int[] keynrs; // nr of keylookup -value in row...
+
+  public StreamLogger errorLogger;
+  public StreamLogger outputLogger;
+
+  public byte[] quote;
+  public byte[] separator;
+  public byte[] newline;
+
+  public ValueMetaInterface bulkTimestampMeta;
+  public ValueMetaInterface bulkDateMeta;
+  public ValueMetaInterface bulkNumberMeta;
+  protected String dbDescription;
+
+  public String schemaTable;
+
+  public String fifoFilename;
+  public OutputStream fifoStream;
+
+  public MySQLBulkLoader.SqlRunner sqlRunner;
+  public ValueMetaInterface[] bulkFormatMeta;
+  ...
+}
+~~~
+
+#### 4.1.5 Step设置对话框
+
+StepDialogInterface 是实现插件设置对话框的 Java 接口。实现该接口的dialog class 负责构造和打开step的设置对话框。
+
+| **Java Interface** | [org.pentaho.di.trans.step.StepDialogInterface](http://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/StepDialogInterface.html) |
+| ------------------ | ------------------------------------------------------------ |
+| **Base class**     | [org.pentaho.di.ui.trans.step.BaseStepDialog](http://javadoc.pentaho.com/kettle530/kettle-ui-swt-5.3.0.0-javadoc/org/pentaho/di/ui/trans/step/BaseStepDialog.html) |
+
+每当在Kettle客户端（Spoon）中打开step设置时，系统都会实例化传入StepMetaInterface对象的对话框类，并在对话框上调用open（）。 SWT 是 Kettle客户端的本机窗口环境，是用于实现步骤对话框的框架。
+
+```java
+/**
+ * 此方法仅在对话框确认或取消后返回。该方法必须符合这些规则。
+ *    如果dialog已确认:
+ *      StepMetaInterface 对象必须更新为新的step设置
+ *      如果更改了任何步骤设置，则必须将 StepMetaInterface 对象标志的“已更改”标志设置为 true
+ *      open（） 返回步骤的名称
+ *    如果dialog被取消
+ *      不得更改 StepMetaInterface 对象
+ *      StepMetaInterface 对象的 Changed 标志必须设置为对话框打开时的值
+ *      open（） 必须返回空值
+ */
+public String open()
+```
+
+StepMetaInterface 对象有一个内部的 Changed 标志，可以使用 hasChanged（） 和 setChanged（） 访问该标志。 Kettle客户端根据 Changed 标志确定转换是否具有未保存的更改，因此对话框必须正确设置标志。
+
+~~~java
+/**
+ * Dialog class for the MySQL bulk loader step.
+ */
+@PluginDialog( id = "MySQLBulkLoader", image = "BLKMYSQL.svg", pluginType = PluginDialog.PluginType.STEP,
+  documentationUrl = "http://wiki.pentaho.com/display/EAI/MySQL+Bulk+Loader" )
+public class MySQLBulkLoaderDialog extends BaseStepDialog implements StepDialogInterface {}
+~~~
+
+### 4.2 StarRocks Connector
+
+StarRocks Connerctor 方法主要是基于Kettle中传统数据库的连接操作方法，使用JDBC驱动实现数据库的连接，通过传递INSERT INTO VALUES语句进行数据的导入。该方法相较于上述方法效率相差很多，但其有很强的功能扩展，可以实现类似其他Kettle中已有数据库类似功能。
+
+Kettle同样提供了数据库插件，Kettle使用其进行数据库的正确连接、执行SQL，同时也考虑现有数据的各种特殊功能和不同限制。
+
+Kettle里面，集成的数据库插件都会继承自BaseDatabaseMeta。实现类要实现的方法主要分成3大主题：连接信息、SQL语句和功能标记。
+
+~~~java
+public class MSSQLServerDatabaseMeta extends BaseDatabaseMeta implements DatabaseInterface
+~~~
+
+StarRocks 数据库插件类通过实现如下基础方式，即可通过Kettle中**“表输出”**操作实现StarRocks数据的导入。
+
+#### 4.2.1 数据库连接情况
+
+当Kettle建立数据库连接时将会调用这些函数，或者数据库设置对话框里显示与语句有关的内容时也会调用。
+
+~~~java
+public String getDriverClass()
+
+public int getDefaultDatabasePort()
+
+public int[]getAccessTypeList()
+
+public boolean supportsOptionsInURL()
+
+public String getURL()
+~~~
+
+**1.实现getDriverClass()方法，返回数据库的JDBC驱动类名。**
+
+~~~java
+@Override public String getDriverClass() {
+    String driver = null;
+    //当使用 ODBC 访问时，使用 sun.jdbc.odbc.JdbcOdbcDriver
+    if ( getAccessType() == DatabaseMeta.TYPE_ACCESS_ODBC ) {
+      driver = "sun.jdbc.odbc.JdbcOdbcDriver";
+    }else {
+      driver = determineDriverClass();
+    }
+    return driver;
+  }
+
+  private static String determineDriverClass() {
+    if ( driverClass.isEmpty() ) {
+      try {
+        //mysql8.0
+        driverClass = "com.mysql.cj.jdbc.Driver";
+        //通过mysql-connector-java中的静态块加载所用驱动
+        Class.forName( driverClass );
+      } catch ( ClassNotFoundException e ) {
+        driverClass = "org.gjt.mm.mysql.Driver";
+      }
+    }
+    return driverClass;
+  }
+~~~
+
+**2.实现getDefaultDatabasePort()方法，返回数据库连接所用的默认端口号。**
+
+~~~java
+@Override public int getDefaultDatabasePort() {
+    // MySQL default port is 3306,通过判断DatabaseMeta的访问类型TYPE_ACCESS_NATIVE为0代表是JDBC连接
+    if ( getAccessType() == DatabaseMeta.TYPE_ACCESS_NATIVE ) {
+      return 3306;
+    }
+    return -1;
+  }
+~~~
+
+**3.实现getAccessTypeList()方法，返回数据库支持的连接驱动类型。**
+
+~~~java
+@Override public int[] getAccessTypeList() {
+    //返回支持的访问类型，TYPE_ACCESS_NATIVE为0代表是JDBC连接，TYPE_ACCESS_ODBC为1代表是ODBC连接，TYPE_ACCESS_JNDI为4代表是JNDI连接
+    return new int[] { DatabaseMeta.TYPE_ACCESS_NATIVE, DatabaseMeta.TYPE_ACCESS_ODBC, DatabaseMeta.TYPE_ACCESS_JNDI };
+  }
+~~~
+
+**4.在其父类中实现supportsOptionsInURL()方法，MySQL是否支持URL中的选项，默认值为true。**
+
+~~~java
+@Override
+  public boolean supportsOptionsInURL() {
+    return true;
+  }
+~~~
+
+**5.实现getURL()方法，返回拼接好的数据库连接URL。**
+
+~~~java
+@Override public String getURL( String hostname, String port, String databaseName ) {
+    if ( getAccessType() == DatabaseMeta.TYPE_ACCESS_ODBC ) {
+      return "jdbc:odbc:" + databaseName;
+    } else {
+      if ( Utils.isEmpty( port ) ) {
+        return "jdbc:mysql://" + hostname + "/" + databaseName;
+      } else {
+        return "jdbc:mysql://" + hostname + ":" + port + "/" + databaseName;
+      }
+    }
+  }
+~~~
+
+#### 4.2.2 数据库语句生成
+
+Kettle中构建有效的SQL数据库语句时会调用这些方法。
+
+~~~java
+public String getFieldDefinition()
+
+public String getAddColumnStatement()
+
+public String getSQLColumnExists()
+
+public String getSQLQueryFields() 
+~~~
+
+
+
+**1.实现getFieldDefinition()方法，返回数据库的字段定义，用于组合数据库表的创建语句。**
+
+~~~java
+@Override public String getFieldDefinition( ValueMetaInterface v, String tk, String pk, boolean useAutoinc,
+                                              boolean addFieldName, boolean addCr ) {
+    String retval = "";
+
+    String fieldname = v.getName();
+    // 当插入值的长度等于数据库的最大长度时，将其设置为Integer.MAX_VALUE
+    if ( v.getLength() == DatabaseMeta.CLOB_LENGTH ) {
+      v.setLength( getMaxTextFieldLength() );
+    }
+    int length = v.getLength();
+    //精度
+    int precision = v.getPrecision();
+
+    if ( addFieldName ) {
+      retval += fieldname + " ";
+    }
+    int type = v.getType();
+    switch ( type ) {
+      //指示值包含具有纳秒精度的日期时间的值类型
+      case ValueMetaInterface.TYPE_TIMESTAMP:
+      case ValueMetaInterface.TYPE_DATE: //指示值包含日期的值类型
+        retval += "DATETIME";
+        break;
+      case ValueMetaInterface.TYPE_BOOLEAN: //指示值包含布尔值的值类型
+        //判断数据库是否支持Boolean类型的值，如果数据库支持布尔值、位、逻辑、...数据类型 默认值为 false：映射到字符串。
+        if ( supportsBooleanDataType() ) {
+          retval += "BOOLEAN";
+        } else {
+          //如果数据库不支持布尔值、位、逻辑、...数据类型 默认值为 false：映射到字符串。
+          retval += "CHAR(1)";
+        }
+        break;
+	 ...
+  }
+~~~
+
+**2.实现getAddColumnStatement()方法，返回数据库的添加字段语句，组合生成添加一列的SQL语句。**
+
+~~~java
+@Override public String getAddColumnStatement( String tablename, ValueMetaInterface v, String tk, boolean useAutoinc,
+    String pk, boolean semicolon ) {
+    return "ALTER TABLE " + tablename + " ADD " + getFieldDefinition( v, tk, pk, useAutoinc, true, false );
+  }
+~~~
+
+**3.实现getSQLColumnExists()方法，返回数据库的判断列字段是否存在的SQL语句。**
+
+~~~java
+@Override public String getSQLColumnExists( String columnname, String tablename ) {
+    return getSQLQueryColumnFields( columnname, tablename );
+  }
+  //生成Mysql的查询列字段
+  public String getSQLQueryColumnFields( String columnname, String tableName ) {
+    return "SELECT " + columnname + " FROM " + tableName + " LIMIT 0"; //限制检索记录行第0行
+  }
+~~~
+
+**4.实现getSQLQueryFields()方法，返回数据库的查询表字段的SQL语句。**
+
+~~~java
+@Override public String getSQLQueryFields( String tableName ) {
+    return "SELECT * FROM " + tableName + " LIMIT 0";
+  }
+~~~
+
+
+
+#### 4.2.3 功能标记
+
+Kettle中查询使用的数据库是否支持该功能。
+
+~~~java
+public boolean supportsTransactions()
+
+public boolean releaseSavepoint()
+
+public boolean supportsPreparedStatementMetadataRetrieval()
+
+public boolean supportsResultSetMetadataRetrievalOnly()
+~~~
+
+**1.实现supportsTransactions()方法，返回数据库是否支持事务。**
+
+~~~java
+@Override public boolean supportsTransactions() {
+    return false;
+  }
+~~~
+
+**2.实现releaseSavepoint()方法，返回数据库是否允许释放保存点。**
+
+~~~java
+/**
+   * Returns a false as Mysql does not allow for the releasing of savepoints.
+   */
+  @Override public boolean releaseSavepoint() {
+    return false;
+  }
+~~~
+
+**3.在父类BaseDatabaseMeta中已经实现了supportsPreparedStatementMetadataRetrieval()方法，返回数据库是否支持预编译准备 SELECT 语句来检索结果元数据。**
+
+~~~java
+@Override
+  public boolean supportsPreparedStatementMetadataRetrieval() {
+    return true;
+  }
+~~~
+
+**4.在父类BaseDatabaseMeta中已经实现了supportsResultSetMetadataRetrievalOnly()方法，返回数据库是否只支持对结果集进行元数据检索，而不支持对语句进行检索（即使语句已执行）。**
+
+~~~java
+@Override
+public boolean supportsResultSetMetadataRetrievalOnly() {
+  return false;
+}
+~~~
 
 ## 五、项目开发计划
