@@ -404,4 +404,371 @@ StarRocks Connector方法使用INSERT语句进行数据的导入相对上一种�
 
 ## 四、项目实现细节
 
+### 4.1 StarRocks-Bulk-Loader
+
+StarRocks-Bulk-Loader方法需要我们实现一个Step插件。step在 Kettle数据流中实现数据处理任务， 它对数据行流进行操作。Step专为输入、处理或输出而设计。输入步骤从外部数据源（如文件或数据库）提取数据行。处理步骤处理数据行、执行字段计算和流操作，例如联接或筛选。 输出步骤将处理后的数据写回存储、文件或数据库。
+
+#### 4.1.1 Step plugins实现
+
+step plugin通过实现四个不同的 Java 接口与 Kettle 集成。每个接口代表由Kettle Step执行的一组职责。 每个接口都有一个基类，该基类实现接口的大部分，以简化插件开发。
+
+所有步骤接口和相应的基类都在 org.pentaho.di.trans.step 包中。
+
+| Java Interface      | Base Class                                  | Main Responsibilities                                        |
+| ------------------- | ------------------------------------------- | ------------------------------------------------------------ |
+| StepMetaInterface   | BaseStepMeta                                | * 存储step设置信息<br/>* 验证step设置信息<br/>* 序列化step设置信息<br/>* 提供获取step类的方法<br/>* 执行行布局更改 |
+| StepDialogInterface | org.pentaho.di.ui.trans.step.BaseStepDialog | * step属性信息配置窗口                                       |
+| StepInterface       | BaseStep                                    | * initialization<br>* row processing<br>* clean-up           |
+| StepDataInterface   | BaseStepData                                | * 为数据处理提高数据存储                                     |
+
+一个Step plugins至少需要实现如上四个接口:
+
+* org.pentaho.di.trans.step.StepMetaInterface：元数据的处理，加载xml，校验，主要是对一个Step的定义的基本数据。 
+
+* org.pentaho.di.trans.step. StepDataInterface:数据处理涉及的具体数据，以及对数据的状态的设置和回收。 
+
+* org.pentaho.di.trans.step. StepInterface：负责数据处理，转换和流转。这里面主要由processRow()方法来处理。 
+
+* org.pentaho.di.trans.step. StepDialogInterface：提供GUI/dialog，编辑Step的元数据。
+
+#### 4.1.2 StarRocks-Bulk-Loader实现
+
+以MySQLBulkLoader为例详细介绍StarRocksBulkLoader中行数据的组合、传输文件的写入以及数据加载的过程。
+
+~~~java
+public class MySQLBulkLoader extends BaseStep implements StepInterface 
+~~~
+
+MySQLBulkLoader类中主要继承了如下两类。
+
+| **Java Interface** | [org.pentaho.di.trans.step.StepInterface](http://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/StepInterface.html) |
+| ------------------ | ------------------------------------------------------------ |
+| **Base class**     | [org.pentaho.di.trans.step.BaseStep](http://javadoc.pentaho.com/kettle530/kettle-engine-5.3.0.0-javadoc/org/pentaho/di/trans/step/BaseStep.html) |
+
+实现类可以依赖基类，并且只有三个重要的方法来实现它自己。这三种方法在转换执行期间实现step生命周期： initialization, row processing, and clean-up。
+
+![](image/3.5.png)
+
+在初始化期间，Kettle调用一次Step的 init()方法。初始化所有Step后，Kettle会反复调用 processRow（），直到step发出信号，表示它已完成处理所有行。完成行处理后，Kettle调用 dispose()。
+
+##### Step Initialization
+
+init（） 方法在转换准备开始执行时调用。
+
+~~~java
+/**
+ * 每个步骤都有机会执行一次性初始化任务，例如打开文件或建立数据库连接。
+ * 对于从 BaseStep 派生的任何步骤，必须调用 super.init（） 以确保行为正确。
+ * 如果步骤正确初始化，该方法返回 true，如果存在初始化错误，则返回 false。
+ * PDI 将中止转换的执行，以防任何步骤在初始化时返回 false。
+ */
+public boolean init()
+~~~
+
+##### Row processing
+
+Row processing过程中主要执行的**processRow()**函数，其主要实现数据的行处理、文件的写入以及数据的加载发送。将详细介绍其实现流程，如何向StarRocks-Bulk-Loader迁移。
+
+**1.step处理Row信息需要用到processRow（）方法**
+
+StepMetaInterface、StepDataInterface接口都需要在定义插件时实现,在之后简单介绍。
+
+* StepMetaInterface：主要处理流数据和字段信息
+* StepDataInterface：主要是和输出环境有关的信息
+
+~~~java
+@Override
+public boolean processRow( StepMetaInterface smi, StepDataInterface sdi ) throws KettleException {}
+~~~
+
+调用**getRow（）**方法获取每一行的数据值以及元数据值，用于之后每行数据的组装。
+
+~~~java
+Object[] r = getRow(); // Get row from input rowset & set row busy!
+if ( r == null ) { // no more input to be expected...
+  //告诉下一步已经完成数据
+  setOutputDone();
+  closeOutput();
+  return false;
+}
+~~~
+
+在BaseSetp类中会有一个专门的参数first来记录是否为第一行数据。 如果是第一行数据，会将Meta中的数据复制一份到Data中的**public ValueMetaInterface[] bulkFormatMeta**; 最后调用**execute（meta）**主要是为了建立与数据库之间的连接，测试连接和生成的语句是否生效。
+
+~~~java
+if ( first ) {
+  first = false;
+  // Cache field indexes.
+  //data.keynrs是字段数据所对应的index
+  data.keynrs = new int[meta.getFieldStream().length];
+  for ( int i = 0; i < data.keynrs.length; i++ ) {
+    data.keynrs[i] = getInputRowMeta().indexOfValue( meta.getFieldStream()[i] );
+  }
+  //除了Mysql中的date和数值类型，其他的都是String类型
+  data.bulkFormatMeta = new ValueMetaInterface[data.keynrs.length];
+  for ( int i = 0; i < data.keynrs.length; i++ ) {
+    //通过特定的index获得value meta
+    ValueMetaInterface sourceMeta = getInputRowMeta().getValueMeta( data.keynrs[i] );
+    //判断是否为日期
+    if ( sourceMeta.isDate() ) {
+      if ( meta.getFieldFormatType()[i] == MySQLBulkLoaderMeta.FIELD_FORMAT_TYPE_DATE ) {
+        data.bulkFormatMeta[i] = data.bulkDateMeta.clone();
+      } else if ( meta.getFieldFormatType()[i] == MySQLBulkLoaderMeta.FIELD_FORMAT_TYPE_TIMESTAMP ) {
+        data.bulkFormatMeta[i] = data.bulkTimestampMeta.clone(); // default to timestamp
+      }
+    } else if ( sourceMeta.isNumeric()
+        && meta.getFieldFormatType()[i] == MySQLBulkLoaderMeta.FIELD_FORMAT_TYPE_NUMBER ) {
+      data.bulkFormatMeta[i] = data.bulkNumberMeta.clone();
+    }
+    if ( data.bulkFormatMeta[i] == null && !sourceMeta.isStorageBinaryString() ) {
+      data.bulkFormatMeta[i] = sourceMeta.clone();
+    }
+  }
+  // 当是第一行时，执行客户端语句，主要对fifo文件的建立和数据库的连接，以及对其进行测试
+  execute( meta );
+}
+~~~
+
+mysql-bulk-loader源码中是通过将每行数据组装好写入到一个fifo文件中，每当Fifo文件中存储了nr行后则关闭流，并且执行executeLoadCommand()方法实现数据的发送到目标数据库。
+
+当没有写入到一定行数时则实现writeRowToBulk( getInputRowMeta(), r )方法实现传输数据的组合和写入到Fifo文件。
+
+~~~java
+//当Fifo文件写入一定的行数时，就将数据传输数据库
+if ( data.bulkSize > 0 && getLinesOutput() > 0 && ( getLinesOutput() % data.bulkSize ) == 0 ) {
+  //当多少行之后关闭原有的输出文件
+  closeOutput();
+  //拼接执行语句
+  executeLoadCommand();
+}
+//将数据写入到文件中
+writeRowToBulk( getInputRowMeta(), r );
+putRow( getInputRowMeta(), r );
+//递增写入输出目标（数据库、文件、套接字等）的行数。
+incrementLinesOutput();
+~~~
+
+**2.execute()方法调用**
+
+execute()主要是执行语句之前的初始工作。
+
+~~~java
+public boolean execute( MySQLBulkLoaderMeta meta ) throws KettleException {}
+~~~
+
+该方法会首先创建需要写入的文件
+
+~~~java
+//1） 使用“mkfifo”命令创建FIFO文件...
+//确保记录所有可能的输出，也来自 STDERR
+//使用当前的变量空间替换字符串名
+data.fifoFilename = environmentSubstitute( meta.getFifoFileName() );
+File fifoFile = new File( data.fifoFilename );
+if ( !fifoFile.exists() ) {
+  // MKFIFO!
+  //
+  String mkFifoCmd = "mkfifo " + data.fifoFilename;
+  //
+  logBasic( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.CREATINGFIFO",  data.dbDescription, mkFifoCmd ) );
+  // linux 中创建fifo文件，获得Process可用来操控进程
+  Process mkFifoProcess = rt.exec( mkFifoCmd );
+  ...
+  // 当前进程等待
+  int result = mkFifoProcess.waitFor();
+  if ( result != 0 ) {
+    throw new Exception( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.ERRORFIFORC", result, mkFifoCmd ) );
+  }
+  String chmodCmd = "chmod 666 " + data.fifoFilename;
+  logBasic( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.SETTINGPERMISSIONSFIFO",  data.dbDescription, chmodCmd ) );
+  Process chmodProcess = rt.exec( chmodCmd );
+  ...
+  result = chmodProcess.waitFor();
+  if ( result != 0 ) {
+    throw new Exception( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.ERRORFIFORC", result, chmodCmd ) );
+  }
+}
+~~~
+
+之后会实现数据库的连接，并对数据库所需信息进行赋值。因为相较于MySQL数据库StarRocks减少了使用JDBC驱动连接数据库的步骤，这一步骤可在StarRocks连接插件中替换成StarRocks连接，并修改其StarRocks所需的参数。
+
+~~~java
+// 2) 建立数据库的连接
+DBCache.getInstance().clear( meta.getDatabaseMeta().getName() );
+...
+data.db = new Database( this, meta.getDatabaseMeta() );
+//获取连接参数
+data.db.shareVariablesWith( this );
+PluginInterface dbPlugin =
+    PluginRegistry.getInstance().getPlugin( DatabasePluginType.class, meta.getDatabaseMeta().getDatabaseInterface() );
+data.dbDescription = ( dbPlugin != null ) ? dbPlugin.getDescription() : BaseMessages.getString( PKG, "MySQLBulkLoader.UnknownDB" );
+// 连接数据库
+if ( getTransMeta().isUsingUniqueConnections() ) { //检查转换是否使用唯一的数据库连接。
+  synchronized ( getTrans() ) {
+    data.db.connect( getTrans().getTransactionId(), getPartitionID() );
+  }
+} else {
+  data.db.connect( getPartitionID() );
+}
+~~~
+
+最后开始执行加载语句，因为是第一行数据所以并没有数据的载入所以认为该步骤为测试连接情况。
+
+~~~java
+// 3) 开始执行加载语句
+executeLoadCommand();
+~~~
+
+**3.executeLoadCommand()加载语句执行**
+
+该方法主要实现了加载数据语句的组合和最后语句的发送执行。
+
+~~~java
+private void executeLoadCommand() throws Exception {}
+~~~
+
+下面步骤主要实现的是组装mysql的批量加载的语句。可以更换成StarRocks的Stream Load的导入方式。
+
+~~~java
+String loadCommand = "";
+loadCommand +=
+    "LOAD DATA " + ( meta.isLocalFile() ? "LOCAL" : "" ) + " INFILE '"
+        + environmentSubstitute( meta.getFifoFileName() ) + "' ";
+if ( meta.isReplacingData() ) {
+  loadCommand += "REPLACE ";
+} else if ( meta.isIgnoringErrors() ) {
+  loadCommand += "IGNORE ";
+}
+loadCommand += "INTO TABLE " + data.schemaTable + " ";
+if ( !Utils.isEmpty( meta.getEncoding() ) ) {
+  loadCommand += "CHARACTER SET " + meta.getEncoding() + " ";
+}
+String delStr = meta.getDelimiter();
+if ( "\t".equals( delStr ) ) {
+  delStr = "\\t";
+}
+loadCommand += "FIELDS TERMINATED BY '" + delStr + "' ";
+if ( !Utils.isEmpty( meta.getEnclosure() ) ) {
+  loadCommand += "OPTIONALLY ENCLOSED BY '" + meta.getEnclosure() + "' ";
+}
+loadCommand +=
+    "ESCAPED BY '" + meta.getEscapeChar() + ( "\\".equals( meta.getEscapeChar() ) ? meta.getEscapeChar() : "" )
+        + "' ";
+// 设置列名称
+loadCommand += "(";
+for ( int cnt = 0; cnt < meta.getFieldTable().length; cnt++ ) {
+  loadCommand += meta.getDatabaseMeta().quoteField( meta.getFieldTable()[cnt] ); //返回字段名称
+  if ( cnt < meta.getFieldTable().length - 1 ) {
+    loadCommand += ",";
+  }
+}
+//CR：特定操作系统的回车符
+loadCommand += ");" + Const.CR;
+logBasic( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.STARTING",  data.dbDescription, loadCommand ) );
+~~~
+
+该步骤启动执行SQL语句的线程，其中调用了MySQLBulkLoader.java文件中定义的SqlRunner、OpenFifo类。使用OpenFifo类打开了fifo文件的写入流，并将流存入Data中，以便在之后向fifo中写入数据使用。SqlRunner类则是用来执行SQL语句，可以将其更改为curl语句执行Stream Load方式的数据加载。
+
+~~~java
+data.sqlRunner = new SqlRunner( data, loadCommand );
+data.sqlRunner.start();
+// Ready to start writing rows to the FIFO file now...
+//
+if ( !Const.isWindows() ) {
+  logBasic( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.OPENFIFO",  data.fifoFilename ) );
+  OpenFifo openFifo = new OpenFifo( data.fifoFilename, 1000 );
+  openFifo.start();
+  // Wait for either the sql statement to throw an error or the
+  // fifo writer to throw an error
+  while ( true ) {
+    //当前线程执行时插入openFifo
+    openFifo.join( 200 );
+    // 当线程完成时处于终止状态
+    if ( openFifo.getState() == Thread.State.TERMINATED ) {
+      break;
+    }
+    try {
+      data.sqlRunner.checkExcn();
+    } catch ( Exception e ) {
+      // 在UNIX/Linux系统中，当有进程以写模式打开一个FIFO文件时，如果没有其他进程以读模式打开该文件，写入操作将被阻塞。
+      // 因此，在这种情况下，通过打开一个读模式的输入流来读取FIFO文件，可以解除FIFO写入器的阻塞状态。
+      new BufferedInputStream( new FileInputStream( data.fifoFilename ) ).close();
+      openFifo.join();
+      logError( BaseMessages.getString( PKG, "MySQLBulkLoader.Message.ERRORFIFO" ) );
+      logError( "" );
+      throw e;
+    }
+    try {
+      //返回错误信息
+      openFifo.checkExcn();
+    } catch ( Exception e ) {
+      throw e;
+    }
+  }
+  data.fifoStream = openFifo.getFifoStream();
+}
+~~~
+
+SqlRunner主要执行sql语句执行和错误检查。**data.db.execStatement( loadCommand );**语句真正实现了sql语句的数据载入功能。
+
+~~~java
+static class SqlRunner extends Thread {
+  private MySQLBulkLoaderData data;
+  private String loadCommand;
+  private Exception ex;
+  SqlRunner( MySQLBulkLoaderData data, String loadCommand ) {
+    this.data = data;
+    this.loadCommand = loadCommand;
+  }
+  @Override
+  public void run() {
+    try {
+      data.db.execStatement( loadCommand );
+    } catch ( Exception ex ) {
+      this.ex = ex;
+    }
+  }
+  void checkExcn() throws Exception {
+    // This is called from the main thread context to rethrow any saved
+    // excn.
+    if ( ex != null ) {
+      throw ex;
+    }
+  }
+}
+~~~
+
+OpenFifo类打开fifo文件流以及检查错误。
+
+~~~java
+static class OpenFifo extends Thread {
+  private BufferedOutputStream fifoStream = null;
+  private Exception ex;
+  private String fifoName;
+  private int size;
+  OpenFifo( String fifoName, int size ) {
+    this.fifoName = fifoName;
+    this.size = size;
+  }
+  @Override
+  public void run() {
+    try {
+      //用于后续向fifo文件写入数据
+      fifoStream = new BufferedOutputStream( new FileOutputStream( OpenFifo.this.fifoName ), this.size );
+    } catch ( Exception ex ) {
+      this.ex = ex;
+    }
+  }
+  void checkExcn() throws Exception {
+    if ( ex != null ) {
+      throw ex;
+    }
+  }
+  BufferedOutputStream getFifoStream() {
+    return fifoStream;
+  }
+}
+~~~
+
+
+
 ## 五、项目开发计划
