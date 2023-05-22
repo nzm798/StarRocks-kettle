@@ -429,7 +429,7 @@ step plugin通过实现四个不同的 Java 接口与 Kettle 集成。每个接�
 
 一个Step plugins至少需要实现如上四个接口:
 
-* org.pentaho.di.trans.step.StepMetaInterface：元数据的处理，加载xml，校验，主要是对一个Step的定义的基本数据。 
+* org.pentaho.di.trans.step.StepMetaInterface：元数据的处理，加载存储设置的xml，校验，主要是对一个Step的定义的基本数据。 
 
 * org.pentaho.di.trans.step. StepDataInterface:数据处理涉及的具体数据，以及对数据的状态的设置和回收。 
 
@@ -463,10 +463,10 @@ init（） 方法在转换准备开始执行时调用。
 
 ~~~java
 /**
- * 每个步骤都有机会执行一次性初始化任务，例如打开文件或建立数据库连接。
- * 对于从 BaseStep 派生的任何步骤，必须调用 super.init（） 以确保行为正确。
- * 如果步骤正确初始化，该方法返回 true，如果存在初始化错误，则返回 false。
- * PDI 将中止转换的执行，以防任何步骤在初始化时返回 false。
+ * 每个Step都有机会执行一次性初始化任务，例如打开文件或建立数据库连接。
+ * 对于从 BaseStep 派生的任何Step，必须调用 super.init（） 以确保行为正确。
+ * 如果Step正确初始化，该方法返回 true，如果存在初始化错误，则返回 false。
+ * Kettle将中止转换的执行，以防任何Step在初始化时返回 false。
  */
 public boolean init()
 ~~~
@@ -499,7 +499,7 @@ if ( r == null ) { // no more input to be expected...
 }
 ~~~
 
-在BaseSetp类中会有一个专门的参数first来记录是否为第一行数据。 如果是第一行数据，会将Meta中的数据复制一份到Data中的**public ValueMetaInterface[] bulkFormatMeta**; 最后调用**execute（meta）**主要是为了建立与数据库之间的连接，测试连接和生成的语句是否生效。
+在BaseSetp类中会有一个专门的参数first来记录是否为第一行数据。 如果是第一行数据，会将Meta中的数据复制一份到Data中的**public ValueMetaInterface[] bulkFormatMeta**;用于之后数据处理。 最后调用**execute（meta）**主要是为了建立与数据库之间的连接，测试连接和生成的语句是否生效。
 
 ~~~java
 if ( first ) {
@@ -535,7 +535,7 @@ if ( first ) {
 }
 ~~~
 
-mysql-bulk-loader源码中是通过将每行数据组装好写入到一个fifo文件中，每当Fifo文件中存储了nr行后则关闭流，并且执行executeLoadCommand()方法实现数据的发送到目标数据库。
+mysql-bulk-loader源码中是通过将每行数据组装好写入到一个fifo文件中，每当Fifo文件中存储了nr行后则关闭流，并且执行executeLoadCommand()方法实现数据发送到目标数据库。
 
 当没有写入到一定行数时则实现writeRowToBulk( getInputRowMeta(), r )方法实现传输数据的组合和写入到Fifo文件。
 
@@ -785,7 +785,7 @@ private void writeRowToBulk( RowMetaInterface rowMeta, Object[] r ) throws Kettl
 
 通过结合Meta数据，将其数据按照Meta中不同列对应的数据类型转换成对应列的，最后转换为Bytes，将其写入fifo数据中。
 
-data.fifoStream就是Data从OpenFifo类中打开的文件流获取。
+data.fifoStream就是Data从OpenFifo类中打开的文件流。
 
 ~~~java
 for ( int i = 0; i < data.keynrs.length; i++ ) {
@@ -900,7 +900,7 @@ StepMetaInterface 接口是插件实现的主要 Java 接口，它主要用于Ke
 
 ~~~java
 /**
- * 每次创建新step时都会调用此方法，并将步骤配置分配或设置为合理的默认值。
+ * 每次创建新step时都会调用此方法，并将Step配置分配或设置为合理的默认值。
  * 创建新step时，Kettle客户端 （Spoon） 将使用此处设置的值。这是确保将步骤设置初始化为非空值。在序列化和对话框填充中处理空值可能很麻烦，因此大多数Kettle Step实现在所有步骤设置中都坚持使用非空值。
  */
 public void setDefault(){
@@ -985,7 +985,7 @@ public void saveRep( Repository rep, IMetaStore metaStore, ObjectId id_transform
     }
 
 /**
- * 每当步骤从Kettle存储库读取其配置时，Kettle都会调用此方法。
+ * 每当Step从Kettle存储库读取其配置时，Kettle都会调用此方法。
  * 参数中给出的Step ID 在使用存储库序列化方法时用作标识符。
  */
 public void readRep( Repository rep, IMetaStore metaStore, ObjectId id_step, List<DatabaseMeta> databases )
@@ -1053,7 +1053,7 @@ public void check()
 | image               | step的 png 图标图像的资源位置                                |
 | name                | step的简短标签                                               |
 | description         | step的详细描述                                               |
-| categoryDescription | step应显示在 PDI 步骤树中的类别。例如输入、输出、转换等。    |
+| categoryDescription | step应显示在 Kettle 步骤树中的类别。例如输入、输出、转换等。 |
 | i18nPackageName     | 如果在注释属性中提供了 i18nPackageName 属性，那么名称、描述和类别描述的值将解释为相对于给定包中包含的消息包的 i18n 键。可以在扩展格式 i18n： key 中提供密钥，以指定与 i18nPackageName 属性中给出的软件包不同的包。 |
 
 以MysqlBulkLoaderMeta为例：
@@ -1393,3 +1393,24 @@ public boolean supportsResultSetMetadataRetrievalOnly() {
 ~~~
 
 ## 五、项目开发计划
+
+本人现在研二准备明年研三毕业硕博连读，因此现在没有找实习并且实验室处于散养状态。所以一直到项目截至时间都比较自由，有很多时间用于项目的开发。如果可以，从六月份我就可以开始着手项目开发的准备工作。如果时间还有剩余可以考虑实现上述两种导入方式。
+
+### 5.1 项目开发第一阶段（06月01日-06月30日）
+
+1. 在Linux服务器上部署StarRocks集群，用于之后项目测试。
+2. 熟悉StarRocks的使用方法，以及Kettle的版本和操作。
+3. 详细阅读StarRocks关于数据导入的源码，以及DataX中writer插件的实现。
+
+### 5.2 项目开发第二阶段（07月01日-08月15日）
+
+1. 仔细阅读Kettle文档中对于插件中方法重写的要求，以及在插件开发中所要用到的辅助类的使用如行处理、日志处理、错误处理等。
+2. 完成Data和Meta类，规划在实现StarRocks数据导入的时候需要用到的参数和Step传输的信息。
+3. 完成主要的StarRocksBulkLoader类用于主要实现对上一Step传来行数据的处理，和数据的导入。
+4. 完成Dialog类，实现数据导入操作的可视化编辑Step 元数据。
+
+### 5.3 项目开发第三阶段（08月16日-09月30日）
+
+1. 对StarRocks-Bulk-Loader插件进行详细测试。
+2. 解决中间发现的问题，思考改进的方式。
+3. 如果还有时间可以继续尝试方法二StarRocks Connector的开发，有了方法一的实践方法二开发会更快。
