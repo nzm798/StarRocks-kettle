@@ -140,6 +140,13 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
     return true;
   }
 
+  /**
+   * 将一行数据写入数据库，带有异常处理和回滚
+   * @param rowMeta
+   * @param r
+   * @return
+   * @throws KettleException
+   */
   protected Object[] writeToTable( RowMetaInterface rowMeta, Object[] r ) throws KettleException {
 
     if ( r == null ) { // Stop: last line or error encountered
@@ -319,6 +326,9 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
           throw new KettleStepException( "No generated keys while \"return generated keys\" is active!" );
         }
       }
+      // KettleDatabaseBatchException：这种异常发生在批处理插入过程中。
+      // 当发生这种异常时，首先清空当前批次的插入语句，然后根据步骤是否开启了错误处理来选择是提交（commit）还是回滚（rollback）。
+      // 如果没有开启错误处理，则会回滚事务并抛出异常。异常信息中包含了错误的详细信息，例如表名、发生错误的前十个异常等。
     } catch ( KettleDatabaseBatchException be ) {
       errorMessage = be.toString();
       batchProblem = true;
@@ -343,6 +353,8 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
         }
         throw new KettleException( msg.toString(), be );
       }
+      // KettleDatabaseException：这种异常发生在数据库操作过程中。
+      // 如果步骤开启了错误处理，会记录错误并可能回滚到安全点；如果未开启错误处理，则根据是否忽略错误来决定是记录警告还是回滚并抛出异常。
     } catch ( KettleDatabaseException dbe ) {
       if ( getStepMeta().isDoingErrorHandling() ) {
         if ( isRowLevel() ) {

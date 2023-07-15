@@ -313,6 +313,7 @@ public class MySQLBulkLoader extends BaseStep implements StepInterface {
       }
 
       writeRowToBulk( getInputRowMeta(), r );
+      // 放入下一步骤，作为下一步的输入
       putRow( getInputRowMeta(), r );
       //递增写入输出目标（数据库、文件、套接字等）的行数。
       incrementLinesOutput();
