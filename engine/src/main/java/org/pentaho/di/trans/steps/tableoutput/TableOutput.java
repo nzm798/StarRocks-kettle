@@ -263,7 +263,7 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
         data.savepoint = data.db.setSavepoint();
       }
       data.db.setValues( data.insertRowMeta, insertRowData, insertStatement );
-      data.db.insertRow( insertStatement, data.batchMode, false ); // false: no commit, it is handled in this step differently
+      data.db.insertRow( insertStatement, data.batchMode, false ); // false: no commit, it is handled in this step differently，没有直接提交，先实现了准备阶段
       if ( isRowLevel() ) {
         logRowlevel( "Written row: " + data.insertRowMeta.getString( insertRowData ) );
       }
