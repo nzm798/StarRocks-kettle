@@ -173,7 +173,7 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
     if ( meta.isTableNameInField() ) {
       // Cache the position of the table name field
       if ( data.indexOfTableNameField < 0 ) {
-        String realTablename = environmentSubstitute( meta.getTableNameField() );
+        String realTablename = environmentSubstitute( meta.getTableNameField() ); // 使用当前变量空间替换字符串
         data.indexOfTableNameField = rowMeta.indexOfValue( realTablename );
         if ( data.indexOfTableNameField < 0 ) {
           String message = "Unable to find table name field [" + realTablename + "] in input row";
@@ -193,6 +193,7 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
       } else {
         insertRowData = r;
       }
+      // 根据时间或区域分表
     } else if ( meta.isPartitioningEnabled()
       && ( meta.isPartitioningDaily() || meta.isPartitioningMonthly() )
       && ( meta.getPartitioningField() != null && meta.getPartitioningField().length() > 0 ) ) {
