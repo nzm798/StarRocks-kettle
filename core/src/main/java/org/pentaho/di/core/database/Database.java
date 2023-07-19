@@ -869,6 +869,8 @@ public class Database implements VariableSpace, LoggingObjectInterface, Closeabl
       // The transformation will stop everything and then we'll do the rollback.
       // The flag is in "performRollback", private only
       //
+      // 如果connectionGroup不为空并且没有强制提交（!force），那么方法直接返回，不执行提交操作。
+      // 这通常在等待转换(transformation)结束时使用，当最后一个数据库副本（打开的计数器）即将关闭时，会执行提交。
       if ( !Utils.isEmpty( connectionGroup ) && !force ) {
         return;
       }

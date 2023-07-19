@@ -399,7 +399,7 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
     if ( generatedKey != null ) {
       outputRowData = RowDataUtil.addValueData( outputRowData, rowMeta.size(), generatedKey );
     }
-
+    // 该段处理批处理的错误信息
     if ( data.batchMode ) {
       if ( sendToErrorRow ) {
         if ( batchProblem ) {
@@ -440,6 +440,13 @@ public class TableOutput extends BaseDatabaseStep implements StepInterface {
     return log.isRowLevel();
   }
 
+  /**
+   * 该方法用于批量处理中出现错误的信息
+   * @param errorMessage
+   * @param updateCounts
+   * @param exceptionsList
+   * @throws KettleException
+   */
   private void processBatchException( String errorMessage, int[] updateCounts, List<Exception> exceptionsList ) throws KettleException {
     // There was an error with the commit
     // We should put all the failing rows out there...
