@@ -116,7 +116,7 @@ public class MySQLBulkLoaderMeta extends BaseStepMeta implements StepMetaInterfa
   private String fifoFileName;
 
   /** database connection */
-  private DatabaseMeta databaseMeta;
+    private DatabaseMeta databaseMeta;
 
   /** Field name of the target table */
   @Injection( name = "FIELD_TABLE", group = "FIELDS" )
@@ -438,6 +438,7 @@ public class MySQLBulkLoaderMeta extends BaseStepMeta implements StepMetaInterfa
             remarks.add( cr );
 
             // How about the fields to insert/dateMask in the table?
+            // 检查目标表中是否有要输入的字段名称
             first = true;
             error_found = false;
             error_message = "";
@@ -484,7 +485,7 @@ public class MySQLBulkLoaderMeta extends BaseStepMeta implements StepMetaInterfa
           boolean error_found = false;
 
           for ( int i = 0; i < fieldStream.length; i++ ) {
-            ValueMetaInterface v = prev.searchValueMeta( fieldStream[i] );
+            ValueMetaInterface v = prev.searchValueMeta( fieldStream[i] ); // 用于寻找数据类型编码对应数据类型的名称
             if ( v == null ) {
               if ( first ) {
                 first = false;
