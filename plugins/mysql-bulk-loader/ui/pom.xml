@@ -35,7 +35,6 @@
       <artifactId>kettle-ui-swt</artifactId>
       <scope>provided</scope>
     </dependency>
-
     <!-- SWT it required to compile any version of any architecture will work -->
     <dependency>
       <groupId>org.eclipse.swt</groupId>
