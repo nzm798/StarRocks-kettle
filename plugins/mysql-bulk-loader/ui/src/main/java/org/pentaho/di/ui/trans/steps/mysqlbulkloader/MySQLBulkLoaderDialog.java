@@ -611,7 +611,7 @@ public class MySQLBulkLoaderDialog extends BaseStepDialog implements StepDialogI
         cancel();
       }
     } );
-
+    // 获取table的名称
     wbTable.addSelectionListener( new SelectionAdapter() {
       public void widgetSelected( SelectionEvent e ) {
         getTableName();
@@ -911,17 +911,15 @@ public class MySQLBulkLoaderDialog extends BaseStepDialog implements StepDialogI
     try {
       RowMetaInterface r = transMeta.getPrevStepFields( stepname );
       if ( r != null ) {
-        TableItemInsertListener listener = new TableItemInsertListener() {
-          public boolean tableItemInserted( TableItem tableItem, ValueMetaInterface v ) {
-            if ( v.getType() == ValueMetaInterface.TYPE_DATE ) {
-              // The default is : format is OK for dates, see if this sticks later on...
-              //
-              tableItem.setText( 3, "Y" );
-            } else {
-              tableItem.setText( 3, "Y" ); // default is OK too...
-            }
-            return true;
+        TableItemInsertListener listener = (tableItem, v) -> {
+          if ( v.getType() == ValueMetaInterface.TYPE_DATE ) {
+            // The default is : format is OK for dates, see if this sticks later on...
+            //
+            tableItem.setText( 3, "Y" );
+          } else {
+            tableItem.setText( 3, "Y" ); // default is OK too...
           }
+          return true;
         };
         BaseStepDialog.getFieldsFromPrevious( r, wReturn, 1, new int[] { 1, 2 }, new int[] {}, -1, -1, listener );
       }
